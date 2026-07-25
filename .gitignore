@@ -1,0 +1,5 @@
+.env
+covid19_eda_report.html
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
