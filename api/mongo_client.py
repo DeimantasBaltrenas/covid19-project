@@ -12,11 +12,14 @@ from pymongo.database import Database
 
 load_dotenv()
 
-_client: MongoClient | None = None
+# Created once, at module import time (i.e. when the API process starts up,
+# on the main thread) rather than lazily on the first request. FastAPI runs
+# synchronous endpoint functions in a worker thread pool; creating the
+# MongoClient there instead of at startup was causing an SSL handshake
+# failure against Atlas on this Windows setup.
+_client: MongoClient = MongoClient(os.environ['MONGODB_URI'])
 
 
 def get_db() -> Database:
-    global _client
-    if _client is None:
-        _client = MongoClient(os.environ['MONGODB_URI'])
+    """Returns a connection to the 'covid19_project' database in MongoDB."""
     return _client['covid19_project']
