@@ -1,0 +1,16 @@
+# Core dependencies for Snowflake and MongoDB access
+snowflake-connector-python[pandas]
+pymongo
+python-dotenv
+
+# Data processing / automated EDA (Task 2)
+pandas
+ydata-profiling
+
+# API (Task 4)
+fastapi
+uvicorn[standard]
+
+# ydata-profiling depends on pkg_resources, which was removed from
+# setuptools 81+. Pin below that to avoid a ModuleNotFoundError.
+setuptools<81
