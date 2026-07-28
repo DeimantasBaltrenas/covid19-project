@@ -7,11 +7,15 @@ sources through a single FastAPI application. Run with:
 """
 
 from datetime import date, datetime, timezone
+import json
 from typing import Optional
 
 import pandas as pd
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
+from sklearn.cluster import KMeans
+from sklearn.preprocessing import StandardScaler
+from statsmodels.tsa.holtwinters import ExponentialSmoothing
 
 from api.mongo_client import get_db
 from api.snowflake_client import run_query
@@ -113,7 +117,11 @@ def get_cases_rolling_average(
     rows = get_cases(country=country, case_type=case_type, start_date=start_date, end_date=end_date)
     df = pd.DataFrame(rows)
     df["ROLLING_AVG_NEW_CASES"] = df["NEW_CASES"].rolling(window=window, min_periods=1).mean()
-    return df.to_dict(orient="records")
+    # df.to_dict() leaves NaN as float('nan'), which Starlette's default
+    # JSON response rejects ("Out of range float values are not JSON
+    # compliant"). pandas' own to_json() serializes NaN as null correctly,
+    # so we round-trip through it instead.
+    return json.loads(df.to_json(orient="records", date_format="iso"))
 
 
 @app.get("/vaccinations")
@@ -140,6 +148,143 @@ def get_vaccinations(
     if not rows:
         raise HTTPException(status_code=404, detail=f"No vaccination data found for country '{country}'")
     return rows
+
+
+# --- Task 6: analytical features --------------------------------------------
+
+@app.get("/cases/forecast")
+def forecast_cases(
+    country: str = Query(..., description="Value of COUNTRY_REGION"),
+    horizon_days: int = Query(14, ge=1, le=90, description="Number of days beyond the last recorded date to forecast"),
+):
+    """
+    Forecasts daily new confirmed cases `horizon_days` beyond the last
+    date recorded for this country, using Holt-Winters exponential
+    smoothing fitted on the fly against that country's full historical
+    daily series. Nothing is precomputed or stored — the model is fit
+    fresh on every request, on whatever data is currently in Snowflake.
+    """
+    rows = get_cases(country=country, case_type="Confirmed", start_date=None, end_date=None)
+    df = pd.DataFrame(rows)
+    if len(df) < 14:
+        raise HTTPException(
+            status_code=422,
+            detail="Not enough historical data for this country to fit a forecasting model.",
+        )
+
+    series = pd.Series(
+        df["NEW_CASES"].clip(lower=0).values,
+        index=pd.to_datetime(df["DATE"]),
+    ).asfreq("D").fillna(0)
+
+    # trend="add" follows the recent upward/downward direction of the
+    # series; seasonal_periods=7 captures the weekly reporting pattern
+    # (e.g. lower counts reported on weekends) documented in Task 2.
+    model = ExponentialSmoothing(
+        series,
+        trend="add",
+        seasonal="add",
+        seasonal_periods=7,
+        initialization_method="estimated",
+    ).fit()
+    forecast = model.forecast(horizon_days)
+
+    last_date = series.index.max()
+    return [
+        {
+            "DATE": (last_date + pd.Timedelta(days=i + 1)).date().isoformat(),
+            "FORECAST_NEW_CASES": max(0, round(float(value))),
+        }
+        for i, value in enumerate(forecast)
+    ]
+
+
+@app.get("/clusters")
+def get_country_clusters(n_clusters: int = Query(4, ge=2, le=10)):
+    """
+    Bonus: groups countries into clusters based on how their COVID-19
+    outcomes compare, using three per-capita metrics: total confirmed
+    cases per 100k population, peak daily new cases per 100k population,
+    and case fatality rate. Population figures come from the same
+    Snowflake Public Data (Free) listing used for enrichment in Task 2,
+    joined by ISO alpha-2 code for the same reason established there.
+
+    Clustering is computed on the fly with scikit-learn's KMeans; no
+    cluster assignment is stored anywhere.
+    """
+    sql = """
+        WITH national_daily AS (
+            SELECT
+                COUNTRY_REGION,
+                ANY_VALUE(ISO3166_1) AS ISO3166_1,
+                DATE,
+                SUM(CASES)      AS CASES,
+                SUM(DIFFERENCE) AS NEW_CASES
+            FROM JHU_COVID_19
+            WHERE CASE_TYPE = 'Confirmed'
+            GROUP BY COUNTRY_REGION, DATE
+        ),
+        confirmed_totals AS (
+            SELECT
+                COUNTRY_REGION,
+                ANY_VALUE(ISO3166_1) AS ISO3166_1,
+                MAX(CASES)     AS TOTAL_CASES,
+                MAX(NEW_CASES) AS PEAK_NEW_CASES
+            FROM national_daily
+            GROUP BY COUNTRY_REGION
+        ),
+        deaths_totals AS (
+            SELECT COUNTRY_REGION, MAX(CASES) AS TOTAL_DEATHS
+            FROM (
+                SELECT COUNTRY_REGION, DATE, SUM(CASES) AS CASES
+                FROM JHU_COVID_19
+                WHERE CASE_TYPE = 'Deaths'
+                GROUP BY COUNTRY_REGION, DATE
+            )
+            GROUP BY COUNTRY_REGION
+        ),
+        population AS (
+            SELECT geo.ISO_ALPHA2, pop.VALUE AS POPULATION_TOTAL
+            FROM SNOWFLAKE_PUBLIC_DATA_FREE.PUBLIC_DATA_FREE.GEOGRAPHY_INDEX geo
+            JOIN SNOWFLAKE_PUBLIC_DATA_FREE.PUBLIC_DATA_FREE.WORLD_BANK_TIMESERIES pop
+                ON geo.GEO_ID = pop.GEO_ID
+            WHERE geo.LEVEL = 'Country' AND pop.VARIABLE = 'IDS_SP.POP.TOTL'
+            QUALIFY ROW_NUMBER() OVER (PARTITION BY geo.GEO_ID ORDER BY pop.DATE DESC) = 1
+        )
+        SELECT
+            ct.COUNTRY_REGION,
+            ct.ISO3166_1,
+            ct.TOTAL_CASES,
+            ct.PEAK_NEW_CASES,
+            dt.TOTAL_DEATHS,
+            p.POPULATION_TOTAL
+        FROM confirmed_totals ct
+        LEFT JOIN deaths_totals dt ON ct.COUNTRY_REGION = dt.COUNTRY_REGION
+        LEFT JOIN population p ON ct.ISO3166_1 = p.ISO_ALPHA2
+        WHERE p.POPULATION_TOTAL > 0
+    """
+    rows = run_query(sql)
+    df = pd.DataFrame(rows).dropna(subset=["POPULATION_TOTAL", "TOTAL_CASES"])
+
+    df["CASES_PER_100K"] = df["TOTAL_CASES"] / df["POPULATION_TOTAL"] * 100_000
+    df["PEAK_NEW_CASES_PER_100K"] = df["PEAK_NEW_CASES"] / df["POPULATION_TOTAL"] * 100_000
+    df["CFR_PERCENT"] = df["TOTAL_DEATHS"].fillna(0) / df["TOTAL_CASES"] * 100
+
+    feature_columns = ["CASES_PER_100K", "PEAK_NEW_CASES_PER_100K", "CFR_PERCENT"]
+    # A handful of countries can still end up with a NaN in one of these
+    # engineered columns (e.g. no recorded NEW_CASES at all), which KMeans
+    # cannot handle — drop those rows rather than letting the whole
+    # request fail.
+    df = df.dropna(subset=feature_columns)
+    # Features are on very different scales (per-100k case counts can be
+    # in the tens of thousands; CFR is a small percentage), so they are
+    # standardized before clustering — otherwise KMeans would effectively
+    # cluster on case counts alone and ignore the fatality rate.
+    scaled_features = StandardScaler().fit_transform(df[feature_columns])
+    df["CLUSTER"] = KMeans(n_clusters=n_clusters, random_state=42, n_init=10).fit_predict(scaled_features)
+
+    result = df[["COUNTRY_REGION", "ISO3166_1", *feature_columns, "CLUSTER"]]
+    return json.loads(result.to_json(orient="records"))
 
 
 # --- MongoDB endpoints -----------------------------------------------------

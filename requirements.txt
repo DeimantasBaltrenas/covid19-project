@@ -11,6 +11,14 @@ ydata-profiling
 fastapi
 uvicorn[standard]
 
+# Dashboard (Task 5)
+dash
+requests
+
+# Analytical features (Task 6)
+statsmodels
+scikit-learn
+
 # ydata-profiling depends on pkg_resources, which was removed from
 # setuptools 81+. Pin below that to avoid a ModuleNotFoundError.
 setuptools<81
