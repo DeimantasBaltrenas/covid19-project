@@ -19,6 +19,9 @@ requests
 statsmodels
 scikit-learn
 
+# API caching (Task 8)
+cachetools
+
 # ydata-profiling depends on pkg_resources, which was removed from
 # setuptools 81+. Pin below that to avoid a ModuleNotFoundError.
 setuptools<81

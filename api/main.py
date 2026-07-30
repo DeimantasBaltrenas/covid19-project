@@ -17,6 +17,7 @@ from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
 from statsmodels.tsa.holtwinters import ExponentialSmoothing
 
+from api.cache import cached, clear_cache, get_cache_stats
 from api.mongo_client import get_db
 from api.snowflake_client import run_query
 
@@ -51,12 +52,18 @@ class ExternalSourceCreate(BaseModel):
 # --- Snowflake endpoints ---------------------------------------------------
 
 @app.get("/countries")
+@cached
 def list_countries():
-    """Distinct countries available in the case dataset, with their ISO codes."""
+    """Distinct countries available in the case dataset, with their ISO codes.
+
+    Reads from COVID19_ANALYTICS.PUBLIC.NATIONAL_DAILY_CASES (Task 7) instead
+    of the raw JHU_COVID_19 table, since the same distinct-country list can be
+    read off a table that is about 16x smaller after aggregation.
+    """
     rows = run_query(
         """
-        SELECT DISTINCT COUNTRY_REGION, ANY_VALUE(ISO3166_1) AS ISO3166_1
-        FROM JHU_COVID_19
+        SELECT DISTINCT COUNTRY_REGION, MAX(ISO3166_1) AS ISO3166_1
+        FROM COVID19_ANALYTICS.PUBLIC.NATIONAL_DAILY_CASES
         GROUP BY COUNTRY_REGION
         ORDER BY COUNTRY_REGION
         """
@@ -65,6 +72,7 @@ def list_countries():
 
 
 @app.get("/cases")
+@cached
 def get_cases(
     country: str = Query(..., description="Value of COUNTRY_REGION, e.g. 'United States'"),
     case_type: str = Query("Confirmed", description="Confirmed, Deaths, or Recovered"),
@@ -76,14 +84,20 @@ def get_cases(
 
     Some countries (e.g. the US) report at the county level, so a naive
     query grouped only by country and date returns one row per subregion.
-    This endpoint sums across subregions first, as established in Task 2.
+    That aggregation, established in Task 2, is no longer computed here on
+    every request. Instead it is pre-computed once in
+    COVID19_ANALYTICS.PUBLIC.NATIONAL_DAILY_CASES, a Dynamic Table that
+    incrementally refreshes itself from JHU_COVID_19 (Task 7). This endpoint
+    now just filters and sorts a table that is already aggregated and
+    clustered by (CASE_TYPE, COUNTRY_REGION, DATE), instead of summing across
+    subregions on the fly for every request.
     """
     sql = """
         SELECT
             DATE,
-            SUM(CASES)      AS CASES,
-            SUM(DIFFERENCE) AS NEW_CASES
-        FROM JHU_COVID_19
+            TOTAL_CASES AS CASES,
+            NEW_CASES
+        FROM COVID19_ANALYTICS.PUBLIC.NATIONAL_DAILY_CASES
         WHERE COUNTRY_REGION = %(country)s
           AND CASE_TYPE = %(case_type)s
     """
@@ -94,7 +108,7 @@ def get_cases(
     if end_date:
         sql += " AND DATE <= %(end_date)s"
         params["end_date"] = end_date
-    sql += " GROUP BY DATE ORDER BY DATE"
+    sql += " ORDER BY DATE"
 
     rows = run_query(sql, params)
     if not rows:
@@ -103,6 +117,7 @@ def get_cases(
 
 
 @app.get("/cases/rolling-average")
+@cached
 def get_cases_rolling_average(
     country: str = Query(..., description="Value of COUNTRY_REGION"),
     case_type: str = Query("Confirmed"),
@@ -125,6 +140,7 @@ def get_cases_rolling_average(
 
 
 @app.get("/vaccinations")
+@cached
 def get_vaccinations(
     country: str = Query(..., description="Value of COUNTRY_REGION"),
     start_date: Optional[date] = None,
@@ -153,6 +169,7 @@ def get_vaccinations(
 # --- Task 6: analytical features --------------------------------------------
 
 @app.get("/cases/forecast")
+@cached
 def forecast_cases(
     country: str = Query(..., description="Value of COUNTRY_REGION"),
     horizon_days: int = Query(14, ge=1, le=90, description="Number of days beyond the last recorded date to forecast"),
@@ -160,9 +177,11 @@ def forecast_cases(
     """
     Forecasts daily new confirmed cases `horizon_days` beyond the last
     date recorded for this country, using Holt-Winters exponential
-    smoothing fitted on the fly against that country's full historical
-    daily series. Nothing is precomputed or stored — the model is fit
-    fresh on every request, on whatever data is currently in Snowflake.
+    smoothing fitted against that country's full historical daily series.
+    The result is cached for up to an hour (Task 8), since fitting this
+    model on every request is the most expensive operation in the API and
+    the underlying data does not change faster than the Dynamic Table's
+    own 1-hour refresh cycle (Task 7) anyway.
     """
     rows = get_cases(country=country, case_type="Confirmed", start_date=None, end_date=None)
     df = pd.DataFrame(rows)
@@ -200,6 +219,7 @@ def forecast_cases(
 
 
 @app.get("/clusters")
+@cached
 def get_country_clusters(n_clusters: int = Query(4, ge=2, le=10)):
     """
     Bonus: groups countries into clusters based on how their COVID-19
@@ -209,38 +229,30 @@ def get_country_clusters(n_clusters: int = Query(4, ge=2, le=10)):
     Snowflake Public Data (Free) listing used for enrichment in Task 2,
     joined by ISO alpha-2 code for the same reason established there.
 
-    Clustering is computed on the fly with scikit-learn's KMeans; no
-    cluster assignment is stored anywhere.
+    Clustering is computed with scikit-learn's KMeans; no cluster
+    assignment is stored in a database. The result is cached for up to an
+    hour (Task 8), since re-running KMeans over every country on every
+    request is unnecessary work once the underlying totals have already
+    been computed for that hour. The confirmed/deaths totals below read
+    from COVID19_ANALYTICS.PUBLIC.NATIONAL_DAILY_CASES (Task 7), which is
+    already aggregated to one row per country/case type/date, instead of
+    re-aggregating JHU_COVID_19 from scratch on every request.
     """
     sql = """
-        WITH national_daily AS (
+        WITH confirmed_totals AS (
             SELECT
                 COUNTRY_REGION,
-                ANY_VALUE(ISO3166_1) AS ISO3166_1,
-                DATE,
-                SUM(CASES)      AS CASES,
-                SUM(DIFFERENCE) AS NEW_CASES
-            FROM JHU_COVID_19
+                MAX(ISO3166_1) AS ISO3166_1,
+                MAX(TOTAL_CASES) AS TOTAL_CASES,
+                MAX(NEW_CASES)   AS PEAK_NEW_CASES
+            FROM COVID19_ANALYTICS.PUBLIC.NATIONAL_DAILY_CASES
             WHERE CASE_TYPE = 'Confirmed'
-            GROUP BY COUNTRY_REGION, DATE
-        ),
-        confirmed_totals AS (
-            SELECT
-                COUNTRY_REGION,
-                ANY_VALUE(ISO3166_1) AS ISO3166_1,
-                MAX(CASES)     AS TOTAL_CASES,
-                MAX(NEW_CASES) AS PEAK_NEW_CASES
-            FROM national_daily
             GROUP BY COUNTRY_REGION
         ),
         deaths_totals AS (
-            SELECT COUNTRY_REGION, MAX(CASES) AS TOTAL_DEATHS
-            FROM (
-                SELECT COUNTRY_REGION, DATE, SUM(CASES) AS CASES
-                FROM JHU_COVID_19
-                WHERE CASE_TYPE = 'Deaths'
-                GROUP BY COUNTRY_REGION, DATE
-            )
+            SELECT COUNTRY_REGION, MAX(TOTAL_CASES) AS TOTAL_DEATHS
+            FROM COVID19_ANALYTICS.PUBLIC.NATIONAL_DAILY_CASES
+            WHERE CASE_TYPE = 'Deaths'
             GROUP BY COUNTRY_REGION
         ),
         population AS (
@@ -344,3 +356,24 @@ def create_external_source(source: ExternalSourceCreate):
     }
     result = db["external_sources"].insert_one(doc)
     return {"inserted_id": str(result.inserted_id)}
+
+
+# --- Task 8: cache diagnostics ----------------------------------------------
+
+@app.get("/cache/stats")
+def cache_stats():
+    """Hit/miss counts and current size of the in-memory cache (Task 8).
+
+    Useful for confirming caching is actually working: calling the same
+    endpoint with the same parameters twice should increase "hits" by one
+    on the second call instead of "misses".
+    """
+    return get_cache_stats()
+
+
+@app.post("/cache/clear")
+def cache_clear():
+    """Empties the cache. Mainly useful during testing/demoing Task 8,
+    to force the next request back to a cache miss on demand."""
+    clear_cache()
+    return {"status": "cache cleared"}
