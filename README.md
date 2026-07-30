@@ -1,6 +1,6 @@
 # COVID-19 Data Integration, Analysis, and Visualization Platform
 
-COVID-19 epidemiological is Data Platform that pulls data from Snowflake, enriches it with external economic and demographic data, exposes it through an API, and visualizes it through an interactive dashboard, including forecasting and clustering, with supplementary annotations stored in MongoDB.
+COVID-19 Data Integration, Analysis, and Visualization is platform that pulls data from Snowflake, enriches it with external economic and demographic data, exposes it through an API, and visualizes it through an interactive dashboard, including forecasting and clustering, with supplementary annotations stored in MongoDB.
 
 This README covers what has been built (Tasks 1-10) and reflects finished state of a project.
 
