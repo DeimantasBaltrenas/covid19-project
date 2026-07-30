@@ -1,4 +1,4 @@
-"""automated_eda.py — Pulls COVID-19 case and vaccination data from Snowflake,
+"""automated_eda.py: pulls COVID-19 case and vaccination data from Snowflake,
 enriches it with external demographic/economic data, and generates an
 automated EDA report.
 
@@ -8,6 +8,7 @@ copy it to .env and fill in real values before running.
 """
 
 import os
+
 from dotenv import load_dotenv
 import snowflake.connector
 from ydata_profiling import ProfileReport
@@ -24,8 +25,7 @@ conn = snowflake.connector.connect(
 )
 
 query = """
-SELECT COUNTRY_REGION, ANY_VALUE(ISO3166_1) AS ISO3166_1, DATE,
-       SUM(CASES) AS CASES, SUM(DIFFERENCE) AS NEW_CASES
+SELECT COUNTRY_REGION, ANY_VALUE(ISO3166_1) AS ISO3166_1, DATE, SUM(CASES) AS CASES, SUM(DIFFERENCE) AS NEW_CASES
 FROM JHU_COVID_19
 WHERE CASE_TYPE = 'Confirmed'
 GROUP BY COUNTRY_REGION, DATE
@@ -74,10 +74,7 @@ with conn.cursor() as cur:
     df_econ = cur.fetch_pandas_all()
 
 df_enriched = df_merged.merge(
-    df_econ,
-    left_on='ISO3166_1',
-    right_on='ISO_ALPHA2',
-    how='left'
+    df_econ, left_on='ISO3166_1', right_on='ISO_ALPHA2', how='left'
 )
 
 unmatched = df_enriched['ISO_ALPHA2'].isna().sum()
@@ -90,7 +87,19 @@ if unmatched > 0:
     ))
 
 # --- Automated EDA ---
-profile = ProfileReport(df_enriched, title="COVID-19 Enriched Dataset EDA", minimal=True)
+# ydata_profiling generates a word cloud image by default for both
+# Categorical columns (vars.cat.words) and Text columns (vars.text.words).
+# COUNTRY_REGION and ISO_ALPHA2 are detected as Text type, so both flags
+# need to be set to False to remove the word cloud everywhere.
+profile = ProfileReport(
+    df_enriched,
+    title="COVID-19 Enriched Dataset EDA",
+    minimal=True,
+    vars={
+        "cat": {"words": False},
+        "text": {"words": False},
+    },
+)
 profile.to_file("covid19_eda_report.html")
 
 conn.close()
