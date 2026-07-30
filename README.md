@@ -42,9 +42,9 @@ If more than one virtual environment folder exists in a project (for example `ve
 
 ## What's done
 
-| Task | What it covers
-|---|---|---|
-| 1 | Snowflake trial account, dataset acquired from Marketplace, resource monitor configured |
+| Task | What it covers |
+|---|---|
+| 1 | Snowflake trial account, dataset acquired from  Marketplace, resource monitor configured |
 | 2 | SQL exploration of dataset, Python enrichment with external data, automated EDA |
 | 3 | MongoDB schema for annotations and external source references |
 | 4 | FastAPI backend querying Snowflake and MongoDB, with on-fly rolling-average calculation |
